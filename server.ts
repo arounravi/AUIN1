@@ -8,16 +8,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db_sqlite = new Database("alerts.db");
-db_sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS alerts (
-    id TEXT PRIMARY KEY,
-    email TEXT,
-    threshold REAL,
-    direction TEXT,
-    lastSentAt INTEGER
-  )
-`);
+let db_sqlite: any;
 
 interface Alert {
   id: string;
@@ -124,10 +115,24 @@ setInterval(() => {
   console.log(`[Heartbeat] Server is active: ${new Date(lastHeartbeat).toISOString()}`);
 }, 30000);
 
-// Run initial check immediately
-checkAlerts();
-
 async function startServer() {
+  try {
+    db_sqlite = new Database("alerts.db");
+    db_sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS alerts (
+        id TEXT PRIMARY KEY,
+        email TEXT,
+        threshold REAL,
+        direction TEXT,
+        lastSentAt INTEGER
+      )
+    `);
+    console.log("Database initialized successfully.");
+  } catch (err) {
+    console.error("Failed to initialize database:", err);
+    // Continue anyway, but API routes will fail
+  }
+
   const app = express();
   const PORT = 3000;
 
@@ -212,8 +217,20 @@ async function startServer() {
   });
 
   // API 404 handler - must be before Vite middleware
-  app.use("/api/*", (req, res) => {
-    res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
+  app.all("/api/*", (req, res) => {
+    console.log(`[API 404] ${req.method} ${req.originalUrl}`);
+    res.status(404).json({ 
+      error: `API route not found: ${req.method} ${req.originalUrl}`,
+      availableRoutes: [
+        "GET /api/health",
+        "GET /api/live-rate",
+        "GET /api/alerts",
+        "POST /api/alerts",
+        "DELETE /api/alerts/:id",
+        "PUT /api/alerts/:id",
+        "POST /api/send-alert-email"
+      ]
+    });
   });
 
   // Vite middleware for development
@@ -233,6 +250,11 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    
+    // Start background checks after server is listening
+    console.log("Starting background alert monitor...");
+    checkAlerts();
   });
 }
 

@@ -28,7 +28,7 @@ export function CurrencyDashboard() {
 
   const fetchAlerts = async () => {
     try {
-      const res = await fetch('/api/alerts');
+      const res = await fetch(`/api/alerts?t=${Date.now()}`);
       if (!res.ok) {
         const text = await res.text();
         throw new Error(`HTTP ${res.status}: ${text.substring(0, 100)}`);
@@ -48,7 +48,7 @@ export function CurrencyDashboard() {
 
   const fetchBackendStatus = async () => {
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch(`/api/health?t=${Date.now()}`);
       if (!res.ok) {
         const text = await res.text();
         throw new Error(`HTTP ${res.status}: ${text.substring(0, 100)}`);
