@@ -12,10 +12,58 @@ export function CurrencyDashboard() {
   const [alertInput, setAlertInput] = useState('');
   const [alertEmail, setAlertEmail] = useState('');
   const [alertDirection, setAlertDirection] = useState<'above' | 'below'>('above');
-  const [activeAlert, setActiveAlert] = useState<{ threshold: number, direction: 'above' | 'below', email: string } | null>(null);
+  const [editingAlertId, setEditingAlertId] = useState<string | null>(null);
+  const [activeAlerts, setActiveAlerts] = useState<{ id: string, threshold: number, direction: 'above' | 'below', email: string }[]>([]);
+  const [backendStatus, setBackendStatus] = useState<{ 
+    lastCheckedAt: string | null, 
+    lastHeartbeat: string | null,
+    activeAlerts: number,
+    lastRate: number | null,
+    lastFetchError: string | null,
+    resendConfigured: boolean
+  } | null>(null);
   const [showNotification, setShowNotification] = useState(false);
   const [lastTriggeredRate, setLastTriggeredRate] = useState<number | null>(null);
   const lastAlertSentAt = React.useRef<number>(0);
+
+  const fetchAlerts = async () => {
+    try {
+      const res = await fetch('/api/alerts');
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text.substring(0, 100)}`);
+      }
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        throw new Error(`Expected JSON but got ${contentType || 'unknown'}. Content: ${text.substring(0, 100)}`);
+      }
+      const data = await res.json();
+      setActiveAlerts(data);
+    } catch (err: any) {
+      console.error("Failed to fetch alerts:", err);
+      setError(`Alerts fetch failed: ${err.message}`);
+    }
+  };
+
+  const fetchBackendStatus = async () => {
+    try {
+      const res = await fetch('/api/health');
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text.substring(0, 100)}`);
+      }
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        throw new Error(`Expected JSON but got ${contentType || 'unknown'}. Content: ${text.substring(0, 100)}`);
+      }
+      const data = await res.json();
+      setBackendStatus(data);
+    } catch (err: any) {
+      console.error("Failed to fetch backend status:", err);
+    }
+  };
 
   const fetchRate = async () => {
     // Only set loading on first fetch
@@ -36,7 +84,13 @@ export function CurrencyDashboard() {
 
   useEffect(() => {
     fetchRate();
-    const interval = setInterval(fetchRate, 5000); // Update every 5 seconds for live feed
+    fetchAlerts();
+    fetchBackendStatus();
+    const interval = setInterval(() => {
+      fetchRate();
+      fetchAlerts(); // Also poll alerts to keep in sync with backend
+      fetchBackendStatus();
+    }, 5000); // Update every 5 seconds for live feed
     return () => clearInterval(interval);
   }, []);
 
@@ -72,30 +126,103 @@ export function CurrencyDashboard() {
 
   // Check alerts when rate updates
   useEffect(() => {
-    if (rate !== null && activeAlert !== null) {
+    if (rate !== null && activeAlerts.length > 0) {
       const now = Date.now();
       // Throttle alerts to once every 30 minutes (1800000 ms) to avoid spamming
       if (now - lastAlertSentAt.current > 1800000) {
-        if (activeAlert.direction === 'above' && rate >= activeAlert.threshold) {
+        // Find if any alert is triggered
+        const triggeredAlert = activeAlerts.find(alert => {
+          if (alert.direction === 'above' && rate >= alert.threshold) return true;
+          if (alert.direction === 'below' && rate <= alert.threshold) return true;
+          return false;
+        });
+
+        if (triggeredAlert) {
           lastAlertSentAt.current = now;
-          triggerAlert(rate, activeAlert);
-        } else if (activeAlert.direction === 'below' && rate <= activeAlert.threshold) {
-          lastAlertSentAt.current = now;
-          triggerAlert(rate, activeAlert);
+          triggerAlert(rate, triggeredAlert);
         }
       }
     }
-  }, [rate, activeAlert]);
+  }, [rate, activeAlerts]);
 
-  const handleSetAlert = () => {
+  const handleSetAlert = async () => {
     const val = parseFloat(alertInput);
     if (!isNaN(val) && alertEmail) {
-      lastAlertSentAt.current = 0; // Reset throttle for new alert
-      setActiveAlert({ threshold: val, direction: alertDirection, email: alertEmail });
-      setAlertInput('');
-      setAlertEmail('');
-      setShowNotification(false);
+      try {
+        const res = await fetch('/api/alerts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: alertEmail,
+            threshold: val,
+            direction: alertDirection
+          })
+        });
+        if (!res.ok) throw new Error('Failed to set alert on server');
+        const newAlert = await res.json();
+        
+        lastAlertSentAt.current = 0; // Reset throttle for new alert
+        setActiveAlerts(prev => [...prev, newAlert]);
+        setAlertInput('');
+        setAlertEmail('');
+        setShowNotification(false);
+      } catch (err: any) {
+        window.alert(`Failed to set alert: ${err.message}`);
+      }
     }
+  };
+
+  const handleCancelAlert = async (id: string) => {
+    try {
+      const res = await fetch(`/api/alerts/${id}`, {
+        method: 'DELETE'
+      });
+      if (res.ok) {
+        setActiveAlerts(prev => prev.filter(a => a.id !== id));
+      }
+    } catch (err) {
+      console.error("Failed to cancel alert:", err);
+    }
+  };
+
+  const handleStartEdit = (alert: { id: string, threshold: number, direction: 'above' | 'below', email: string }) => {
+    setEditingAlertId(alert.id);
+    setAlertEmail(alert.email);
+    setAlertInput(alert.threshold.toString());
+    setAlertDirection(alert.direction);
+  };
+
+  const handleUpdateAlert = async () => {
+    if (!editingAlertId) return;
+    const val = parseFloat(alertInput);
+    if (!isNaN(val) && alertEmail) {
+      try {
+        const res = await fetch(`/api/alerts/${editingAlertId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: alertEmail,
+            threshold: val,
+            direction: alertDirection
+          })
+        });
+        if (!res.ok) throw new Error('Failed to update alert on server');
+        const updatedAlert = await res.json();
+        
+        setActiveAlerts(prev => prev.map(a => a.id === editingAlertId ? updatedAlert : a));
+        setEditingAlertId(null);
+        setAlertInput('');
+        setAlertEmail('');
+      } catch (err: any) {
+        window.alert(`Failed to update alert: ${err.message}`);
+      }
+    }
+  };
+
+  const handleCancelEdit = () => {
+    setEditingAlertId(null);
+    setAlertInput('');
+    setAlertEmail('');
   };
 
   return (
@@ -198,31 +325,134 @@ export function CurrencyDashboard() {
           <div className="w-12 h-12 bg-violet-50 rounded-2xl flex items-center justify-center border border-violet-100">
             <Bell className="w-6 h-6 text-violet-600" />
           </div>
-          <div>
-            <h2 className="text-2xl font-bold text-slate-900">Price Alerts</h2>
-            <p className="text-slate-500 text-sm mt-1">Get notified when the market hits your target</p>
+          <div className="flex-1">
+            <h2 className="text-2xl font-bold text-slate-900">Price Alerts ({activeAlerts.length})</h2>
+            <p className="text-slate-500 text-sm mt-1">Get notified when the market hits your target (Monitored 24/7 on server)</p>
           </div>
+          {backendStatus && (
+            <div className="text-right">
+              <div className={`flex items-center gap-2 text-xs font-bold px-3 py-1.5 rounded-full border ${backendStatus.lastFetchError ? 'text-red-600 bg-red-50 border-red-100' : 'text-emerald-600 bg-emerald-50 border-emerald-100'}`}>
+                <span className={`w-2 h-2 rounded-full ${backendStatus.lastFetchError ? 'bg-red-500' : 'bg-emerald-500 animate-pulse'}`}></span>
+                {backendStatus.lastFetchError ? 'Backend Monitor Error' : 'Backend Monitor Active'}
+              </div>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Last check: {backendStatus.lastCheckedAt ? new Date(backendStatus.lastCheckedAt).toLocaleTimeString() : 'Never'}
+              </p>
+              <p className="text-[10px] text-slate-400 mt-0.5">
+                Server Heartbeat: {backendStatus.lastHeartbeat ? new Date(backendStatus.lastHeartbeat).toLocaleTimeString() : '...'}
+              </p>
+              {backendStatus.lastFetchError && (
+                <p className="text-[10px] text-red-500 mt-0.5 max-w-[150px] truncate" title={backendStatus.lastFetchError}>
+                  Error: {backendStatus.lastFetchError}
+                </p>
+              )}
+              {!backendStatus.resendConfigured && (
+                <p className="text-[10px] text-amber-500 mt-0.5 font-bold">
+                  ⚠️ RESEND_API_KEY missing
+                </p>
+              )}
+              {backendStatus.resendConfigured && (
+                <p className="text-[9px] text-slate-400 mt-1 italic">
+                  * Resend free tier only sends to your verified email.
+                </p>
+              )}
+            </div>
+          )}
         </div>
 
-        {activeAlert ? (
-          <div className="flex items-center justify-between bg-slate-50 p-6 rounded-2xl border border-slate-200">
-            <div>
-              <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-2">Active Alert</p>
-              <p className="font-medium text-slate-900 text-xl">
-                Notify <span className="font-bold text-blue-600">{activeAlert.email}</span> when rate goes <span className="font-bold text-violet-600">{activeAlert.direction}</span> {activeAlert.threshold.toFixed(2)} INR
-              </p>
-              <p className="text-sm text-slate-500 mt-2">
-                * Alerts are throttled to a maximum of one email every 30 minutes.
-              </p>
+        <div className="space-y-4 mb-8">
+          {activeAlerts.length === 0 ? (
+            <div className="bg-slate-50 p-10 rounded-2xl border border-dashed border-slate-200 text-center">
+              <Bell className="w-10 h-10 text-slate-300 mx-auto mb-4" />
+              <p className="text-slate-500 font-medium">No alerts configured yet.</p>
+              <p className="text-slate-400 text-sm mt-1">Set a target rate below to get started.</p>
             </div>
-            <button
-              onClick={() => setActiveAlert(null)}
-              className="text-sm text-red-600 hover:text-red-700 font-bold px-5 py-2.5 hover:bg-red-50 rounded-xl transition-colors"
-            >
-              Cancel Alert
-            </button>
-          </div>
-        ) : (
+          ) : (
+            activeAlerts.map((alert) => (
+              <div key={alert.id} className="bg-slate-50 p-6 rounded-2xl border border-slate-200">
+                {editingAlertId === alert.id ? (
+                  <div className="space-y-4">
+                    <div className="flex flex-col md:flex-row gap-4">
+                      <div className="flex-1">
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Condition</label>
+                        <select
+                          value={alertDirection}
+                          onChange={(e) => setAlertDirection(e.target.value as 'above' | 'below')}
+                          className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                        >
+                          <option value="above">Goes Above</option>
+                          <option value="below">Goes Below</option>
+                        </select>
+                      </div>
+                      <div className="flex-1">
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Threshold</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={alertInput}
+                          onChange={(e) => setAlertInput(e.target.value)}
+                          className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Email</label>
+                        <input
+                          type="email"
+                          value={alertEmail}
+                          onChange={(e) => setAlertEmail(e.target.value)}
+                          className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex justify-end gap-3">
+                      <button
+                        onClick={handleCancelEdit}
+                        className="text-xs font-bold text-slate-500 hover:text-slate-700 px-4 py-2"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleUpdateAlert}
+                        className="text-xs font-bold bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700"
+                      >
+                        Save Changes
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-2">Active Alert</p>
+                      <p className="font-medium text-slate-900 text-xl">
+                        Notify <span className="font-bold text-blue-600">{alert.email}</span> when rate goes <span className="font-bold text-violet-600">{alert.direction}</span> {alert.threshold.toFixed(2)} INR
+                      </p>
+                      <p className="text-sm text-slate-500 mt-2">
+                        * Alerts are throttled to a maximum of one email every 30 minutes.
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleStartEdit(alert)}
+                        className="text-sm text-blue-600 hover:text-blue-700 font-bold px-4 py-2 hover:bg-blue-50 rounded-xl transition-colors"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => handleCancelAlert(alert.id)}
+                        className="text-sm text-red-600 hover:text-red-700 font-bold px-4 py-2 hover:bg-red-50 rounded-xl transition-colors"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="bg-slate-50/50 p-8 rounded-3xl border border-dashed border-slate-200">
+          <h3 className="text-lg font-bold text-slate-900 mb-6">Create New Alert</h3>
           <div className="flex flex-col gap-6">
             <div className="flex flex-col md:flex-row gap-6 items-end">
               <div className="flex-1 w-full">
@@ -230,7 +460,7 @@ export function CurrencyDashboard() {
                 <select
                   value={alertDirection}
                   onChange={(e) => setAlertDirection(e.target.value as 'above' | 'below')}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-700"
+                  className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-700"
                 >
                   <option value="above">Goes Above</option>
                   <option value="below">Goes Below</option>
@@ -244,7 +474,7 @@ export function CurrencyDashboard() {
                   value={alertInput}
                   onChange={(e) => setAlertInput(e.target.value)}
                   placeholder={rate ? `e.g. ${(rate + 0.5).toFixed(2)}` : "e.g. 55.50"}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-900"
+                  className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-900"
                 />
               </div>
             </div>
@@ -256,7 +486,7 @@ export function CurrencyDashboard() {
                   value={alertEmail}
                   onChange={(e) => setAlertEmail(e.target.value)}
                   placeholder="your@email.com"
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-900"
+                  className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3.5 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-900"
                 />
               </div>
               <button
@@ -268,7 +498,7 @@ export function CurrencyDashboard() {
               </button>
             </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );
