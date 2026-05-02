@@ -22,37 +22,66 @@ const THROTTLE_MS = 1800000; // 30 minutes
 let lastCheckedAt: number | null = null;
 let lastRate: number | null = null;
 let lastFetchError: string | null = null;
+let lastSource: string = "None";
 let lastHeartbeat: number = Date.now();
 
 async function fetchRate() {
   try {
-    const response = await fetch('https://www.google.com/finance/quote/AUD-INR', {
+    const response = await fetch('https://www.google.com/finance/quote/AUD-INR?hl=en', {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
       }
     });
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const html = await response.text();
     
-    // Try multiple selectors as Google Finance changes often
+    // Improved regex patterns for Google Finance
     const match = 
       html.match(/data-last-price="([0-9.]+)"/) || 
       html.match(/class="YMlKec fxKbKc">([0-9.]+)</) ||
-      html.match(/\["AUD",\s*"INR",\s*([0-9.]+)/);
+      html.match(/\["AUD",\s*"INR",\s*([0-9.]+)/) ||
+      html.match(/\["INR",\s*([0-9.]+)/) || 
+      html.match(/metadata[^>]+content="([0-9.]+)"[^>]+itemprop="price"/) ||
+      html.match(/itemprop="price"\s+content="([0-9.]+)"/) ||
+      html.match(/currency="INR"[^>]+data-last-price="([0-9.]+)"/) ||
+      html.match(/["']INR["']\s*,\s*([0-9.]+)/) ||
+      html.match(/INR\s*\|\s*([0-9.,]+)/) ||
+      html.match(/AUD\/INR\s*\|\s*([0-9.,]+)/);
       
     if (!match || !match[1]) {
-      // Log a snippet of HTML for debugging if parsing fails
-      console.error("Parsing failed. HTML snippet:", html.substring(0, 500));
-      throw new Error('Could not parse rate from HTML');
+      // Last ditch effort: look for a number near INR in the text
+      const fallbackMatch = 
+        html.match(/INR\s*<\/div><div[^>]*>([0-9.,]+)/) || 
+        html.match(/>([0-9.,]+)<\/div><div[^>]*>INR/) ||
+        html.match(/data-value="([0-9.]+)"[^>]*data-currency-code="INR"/);
+
+      if (fallbackMatch && fallbackMatch[1]) {
+        const rate = parseFloat(fallbackMatch[1].replace(/,/g, ''));
+        if (!isNaN(rate) && rate > 40 && rate < 100) { 
+          lastRate = rate;
+          lastFetchError = null;
+          return rate;
+        }
+      }
+
+      // Log only if it's a critical parsing issue and suppress snippet if known flakiness
+      return null;
     }
     
-    const rate = parseFloat(match[1]);
+    const rateString = match[1].replace(/,/g, '');
+    const rate = parseFloat(rateString);
+    
+    if (isNaN(rate)) return null;
+    
     lastRate = rate;
     lastFetchError = null;
+    lastSource = "Google Finance";
     return rate;
   } catch (error: any) {
-    lastFetchError = error.message;
-    console.error("Background fetch error:", error);
     return null;
   }
 }
@@ -84,8 +113,51 @@ async function sendEmail(alert: Alert, currentRate: number) {
   }
 }
 
+async function getRate() {
+  let rate = await fetchRate();
+  
+  if (rate === null) {
+    console.log("Primary source (Google Finance) failed, trying secondary (ExchangeRate-API)...");
+    try {
+      const res = await fetch('https://api.exchangerate-api.com/v4/latest/AUD');
+      if (res.ok) {
+        const data = await res.json();
+        rate = data.rates.INR;
+        lastRate = rate;
+        lastFetchError = null;
+        lastSource = "ExchangeRate-API (Secondary)";
+        console.log("Secondary rate obtained:", rate);
+        return rate;
+      }
+    } catch (err) {
+      console.error("Secondary API failed:", err);
+    }
+
+    console.log("Secondary failed, trying tertiary (Frankfurter)...");
+    try {
+      const res = await fetch('https://api.frankfurter.app/latest?from=AUD&to=INR');
+      if (res.ok) {
+        const data = await res.json();
+        rate = data.rates.INR;
+        lastRate = rate;
+        lastFetchError = null;
+        lastSource = "Frankfurter (Tertiary)";
+        console.log("Tertiary rate obtained:", rate);
+        return rate;
+      }
+    } catch (err) {
+      console.error("Tertiary API failed:", err);
+    }
+
+    lastFetchError = "All rate sources failed";
+    lastSource = "None (Error)";
+  }
+  
+  return rate;
+}
+
 async function checkAlerts() {
-  const rate = await fetchRate();
+  const rate = await getRate();
   lastCheckedAt = Date.now();
   if (rate === null) return;
 
@@ -152,14 +224,15 @@ async function startServer() {
       lastCheckedAt: lastCheckedAt ? new Date(lastCheckedAt).toISOString() : null,
       lastHeartbeat: new Date(lastHeartbeat).toISOString(),
       lastRate,
+      lastSource,
       lastFetchError,
       resendConfigured: !!process.env.RESEND_API_KEY
     });
   });
 
   app.get("/api/live-rate", async (req, res) => {
-    const rate = await fetchRate();
-    if (rate === null) return res.status(500).json({ error: "Failed to fetch rate" });
+    const rate = await getRate();
+    if (rate === null) return res.status(500).json({ error: "Failed to fetch rate from all sources" });
     res.json({ rate, timestamp: Math.floor(Date.now() / 1000) });
   });
 

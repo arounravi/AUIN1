@@ -19,6 +19,7 @@ export function CurrencyDashboard() {
     lastHeartbeat: string | null,
     activeAlerts: number,
     lastRate: number | null,
+    lastSource: string,
     lastFetchError: string | null,
     resendConfigured: boolean
   } | null>(null);
@@ -337,6 +338,9 @@ export function CurrencyDashboard() {
               </div>
               <p className="text-[10px] text-slate-400 mt-1">
                 Last check: {backendStatus.lastCheckedAt ? new Date(backendStatus.lastCheckedAt).toLocaleTimeString() : 'Never'}
+              </p>
+              <p className="text-[10px] text-blue-500 mt-0.5 font-medium">
+                Source: {backendStatus.lastSource}
               </p>
               <p className="text-[10px] text-slate-400 mt-0.5">
                 Server Heartbeat: {backendStatus.lastHeartbeat ? new Date(backendStatus.lastHeartbeat).toLocaleTimeString() : '...'}
